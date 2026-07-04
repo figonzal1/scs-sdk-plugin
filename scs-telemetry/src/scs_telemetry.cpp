@@ -405,7 +405,6 @@ static auto clear_fined_ticker = 0;
 static auto clear_tollgate_ticker = 0;
 static auto clear_ferry_ticker = 0;
 static auto clear_train_ticker = 0;
-static auto clear_refuel_payed_ticker = 0;
 
 // TODO: REWORK BOTH CLEAN FUNCTION AND ADD MORE FOR SINGLE CONFIG attribute
 //  Function: set_job_values_zero
@@ -525,7 +524,6 @@ SCSAPI_VOID telemetry_frame_start(const scs_event_t UNUSED(event),
       if (!refuel)
       {
         refuel = true;
-        clear_refuel_payed_ticker = 0;
       }
     }
     else if (current_fuel_value < last_fuel_value)
@@ -541,7 +539,11 @@ SCSAPI_VOID telemetry_frame_start(const scs_event_t UNUSED(event),
       refuel = false;
 
       telem_ptr->gameplay_f.refuelAmount = telem_ptr->truck_f.fuel - start_fuel;
-      telem_ptr->special_b.refuelPayed = true;
+      // Toggle (not assign) so edge-detecting clients see a change on every
+      // refuel, not just the first one per game session. Matches the
+      // semantics of fined/tollgate/ferry/train below (see
+      // RenCloud/scs-sdk-plugin#98).
+      telem_ptr->special_b.refuelPayed ^= true;
     }
 
     // update last value every few ticks (refuel rate is not constant and the
