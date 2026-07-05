@@ -1,7 +1,7 @@
 
 # Telemetry plugin for Euro Truck Simulator 2 and American Truck Simulator
 
-This is a fork of RenCloud's [scs-sdk-plugin](https://github.com/RenCloud/scs-sdk-plugin/) project. It adds macOS and Linux support by translating Windows API calls for memory-mapped files to their POSIX equivalents:
+This is a fork of RenCloud's [scs-sdk-plugin](https://github.com/RenCloud/scs-sdk-plugin/) project, itself forked from [truckermudgeon/scs-sdk-plugin](https://github.com/truckermudgeon/scs-sdk-plugin). It adds macOS and Linux support by translating Windows API calls for memory-mapped files to their POSIX equivalents:
 
 | Windows            | macOS / Linux |
 | ------------------ | ------------- |
@@ -54,6 +54,18 @@ cmake --build build --config Release
 ```
 
 Binaries will be in the `build/bin` directory.
+
+## Changes in this fork
+
+- **Fixed `refuelPayed` only firing once per game session.** The flag was set with plain
+  assignment (`= true`) instead of the toggle (`^= true`) used by every other one-shot event
+  (`fined`, `tollgate`, `ferry`, `train`). Edge-detecting clients (comparing the current frame's
+  value against the previous one) never saw a second change once the flag latched `true`, so
+  refuels after the first one in a session went unreported. See
+  [RenCloud/scs-sdk-plugin#98](https://github.com/RenCloud/scs-sdk-plugin/issues/98) for the
+  toggle semantics this aligns with. The unused `clear_refuel_payed_ticker` (dead code from a
+  reset that was apparently never implemented) was also removed. The shared-memory layout is
+  unchanged, so existing readers (e.g. `trucksim-telemetry`) work without modification.
 
 ## Credits
 
