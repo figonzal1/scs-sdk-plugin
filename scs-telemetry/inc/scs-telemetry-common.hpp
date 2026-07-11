@@ -7,7 +7,7 @@
 // - Shared memory map struct layout
 // - [..]
 
-#define PLUGIN_REVID 13
+#define PLUGIN_REVID 14
 
 #define ETS2 1
 #define ATS 2

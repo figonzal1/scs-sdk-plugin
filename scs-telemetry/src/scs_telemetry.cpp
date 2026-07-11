@@ -11,7 +11,6 @@
 
 #include <algorithm>
 #include <cassert>
-#include <cmath>
 #include <cstdarg>
 #include <string>
 #include <cstring>
@@ -448,39 +447,16 @@ static auto fuel_ticker2 = 0;
 static auto last_fuel_value = 0.0f;
 static auto current_fuel_value = 0.0f;
 static auto refuel = false;
-static auto fuel_tmp = 0.0f;
 static auto start_fuel = 0.0f;
-// Tras un load/teleport (timer_restart) el canal fuel puede quedar momentáneamente en
-// 0 mientras el actor del camión se reconstruye, antes de que el estado guardado se
-// aplique. Un evento de config SCS_TELEMETRY_CONFIG_truck no sirve como señal de
-// "listo": trae propiedades ESTÁTICAS del camión (capacidad de tanque, marchas, etc.),
-// no el nivel de combustible en sí. Evidencia real: el salto de fuel se revela recién
-// al encender el motor tras cargar (el motor siempre queda apagado tras un load). Por
-// eso el settling se libera en el primer borde apagado->encendido del motor posterior
-// al timer_restart (+ colchón corto de estabilidad), con un timeout de seguridad por si
-// el motor ya estaba encendido al cargar (no habría borde que detectar). Mientras
-// post_load_settling esté activo también se congelan las transiciones de onJob
-// (telemetry_configuration, rama job) — el mismo load reenvía su config y puede pasar
-// transitoriamente por "vacío" antes de reflejar el job real, disparando un job-started
-// fantasma si no se suprime igual que el de fuel.
-static const int FUEL_SETTLE_STABLE_FRAMES_REQUIRED = 10;
-static const int FUEL_SETTLE_FALLBACK_MAX_FRAMES = 300;
-static const float FUEL_SETTLE_EPSILON = 0.05f;
-static auto post_load_settling = false;
-static auto fuel_settle_stable_frames = 0;
-static auto fuel_settle_reference = 0.0f;
-static auto fuel_settle_engine_seen = false;
-static auto fuel_settle_frames_elapsed = 0;
-static auto engine_enabled_prev = false;
 
 // Un repostaje real sube el combustible de forma sostenida durante varios segundos.
-// Un glitch de actor (recarga/reinicialización tras un load, detectado o no por
-// post_load_settling — la evidencia muestra que timer_restart NO se dispara de forma
-// confiable en loads posteriores al primero de la sesión) es, en cambio, un blip de
-// 1-2 frames. En vez de perseguir la señal de "cuándo hubo load", exigimos que la
-// subida se sostenga FUEL_RISE_CONFIRM_FRAMES_REQUIRED frames seguidos sin retroceder
-// antes de comprometernos a refuel=true. Reemplaza el doble buffer start_fuel/fuel_tmp
-// original como fuente del baseline.
+// Cargar una partida, en cambio, puede producir un blip de 1-2 frames en el canal fuel
+// mientras el actor del camión se reconstruye, que la heurística ingenua (confiar en la
+// subida desde el primer frame) malinterpretaba como el inicio de un repostaje, y
+// terminaba disparando un refuel-paid fantasma. Solución: exigir que la subida se
+// sostenga FUEL_RISE_CONFIRM_FRAMES_REQUIRED frames seguidos sin retroceder antes de
+// comprometernos a refuel=true. Así se descartan los blips transitorios sin importar su
+// causa, mientras se siguen detectando los repostajes reales (de varios segundos).
 static const int FUEL_RISE_CONFIRM_FRAMES_REQUIRED = 5;
 static auto fuel_rise_pending = false;
 static auto fuel_rise_confirm_frames = 0;
@@ -522,16 +498,6 @@ SCSAPI_VOID telemetry_frame_start(const scs_event_t UNUSED(event),
     last_timestamp = 0;
     last_simulatedtimestamp = 0;
     last_rendertimestamp = 0;
-
-    // Un load/teleport puede saltar el combustible; cancela cualquier detección de
-    // repostaje en curso y entra en modo settling hasta el primer encendido de motor
-    // posterior (ver más abajo).
-    refuel = false;
-    post_load_settling = true;
-    fuel_settle_stable_frames = 0;
-    fuel_settle_engine_seen = false;
-    fuel_settle_frames_elapsed = 0;
-    log_line(SCS_LOG_TYPE_warning, "[refuel-debug] timer_restart -> settling armed");
   }
 
   // Advance the timestamp by delta since last frame.
@@ -556,148 +522,88 @@ SCSAPI_VOID telemetry_frame_start(const scs_event_t UNUSED(event),
 
     // check fuel value
     current_fuel_value = telem_ptr->truck_f.fuel;
-    const auto engine_enabled_now = telem_ptr->truck_b.engineEnabled;
 
-    if (post_load_settling)
+    if (current_fuel_value > last_fuel_value && last_fuel_value > 0)
     {
-      fuel_settle_frames_elapsed++;
+      fuel_ticker2 = 0;
+      telem_ptr->special_b.refuel = true;
 
-      if (!fuel_settle_engine_seen && engine_enabled_now && !engine_enabled_prev)
+      if (!refuel)
       {
-        // Primer encendido tras el load: acá es donde el canal fuel parece "revelar"
-        // su valor real (evidencia del repro). Empezamos a contar el colchón de
-        // estabilidad desde este punto.
-        fuel_settle_engine_seen = true;
-        fuel_settle_stable_frames = 0;
-      }
-
-      if (fuel_settle_stable_frames == 0 ||
-          fabs(current_fuel_value - fuel_settle_reference) > FUEL_SETTLE_EPSILON)
-      {
-        // Sigue cambiando (o es la primera lectura post-load): todavía no terminó
-        // de reconstruirse el estado del camión.
-        fuel_settle_reference = current_fuel_value;
-        fuel_settle_stable_frames = 1;
-      }
-      else
-      {
-        fuel_settle_stable_frames++;
-      }
-
-      refuel = false;
-      telem_ptr->special_b.refuel = false;
-      start_fuel = current_fuel_value;
-      fuel_tmp = current_fuel_value;
-      last_fuel_value = current_fuel_value;
-
-      const auto ready = fuel_settle_engine_seen &&
-                          fuel_settle_stable_frames >= FUEL_SETTLE_STABLE_FRAMES_REQUIRED;
-      const auto timed_out = fuel_settle_frames_elapsed >= FUEL_SETTLE_FALLBACK_MAX_FRAMES;
-
-      if (ready || timed_out)
-      {
-        post_load_settling = false;
-        log_line(SCS_LOG_TYPE_warning,
-                 "[refuel-debug] settling done (engine_seen=%d, timeout=%d) fuel=%.2f",
-                 fuel_settle_engine_seen ? 1 : 0, timed_out ? 1 : 0,
-                 current_fuel_value);
-      }
-    }
-    else
-    {
-      if (current_fuel_value > last_fuel_value && last_fuel_value > 0)
-      {
-        fuel_ticker2 = 0;
-        telem_ptr->special_b.refuel = true;
-
-        if (!refuel)
+        if (!fuel_rise_pending)
         {
-          if (!fuel_rise_pending)
-          {
-            // Primer frame de subida: todavía no sabemos si es un repostaje real o
-            // un blip de 1-2 frames (glitch de actor). Guardamos el nivel previo a
-            // la subida y esperamos a ver si se sostiene.
-            fuel_rise_pending = true;
-            fuel_rise_confirm_frames = 1;
-            fuel_rise_baseline = last_fuel_value;
-          }
-          else
-          {
-            fuel_rise_confirm_frames++;
-          }
-
-          if (fuel_rise_confirm_frames >= FUEL_RISE_CONFIRM_FRAMES_REQUIRED)
-          {
-            // Se sostuvo lo suficiente: recién ahora lo tratamos como repostaje real.
-            refuel = true;
-            fuel_rise_pending = false;
-            start_fuel = fuel_rise_baseline;
-            log_line(SCS_LOG_TYPE_warning,
-                     "[refuel-debug] rise confirmed baseline=%.2f current=%.2f",
-                     fuel_rise_baseline, current_fuel_value);
-          }
-        }
-      }
-      else if (current_fuel_value < last_fuel_value)
-      {
-        fuel_ticker2 = 0;
-        telem_ptr->special_b.refuel = false;
-
-        if (fuel_rise_pending)
-        {
-          // La subida no se sostuvo — era ruido/glitch, no un repostaje. Se descarta.
-          log_line(SCS_LOG_TYPE_warning,
-                   "[refuel-debug] rise aborted (reverted) baseline=%.2f current=%.2f",
-                   fuel_rise_baseline, current_fuel_value);
-          fuel_rise_pending = false;
-        }
-      }
-
-      // refuel is true, but engine is now active? than refuel is finished and
-      // payed, fire event
-      if (refuel && telem_ptr->truck_b.engineEnabled)
-      {
-        refuel = false;
-
-        telem_ptr->gameplay_f.refuelAmount = telem_ptr->truck_f.fuel - start_fuel;
-        // Toggle (not assign) so edge-detecting clients see a change on every
-        // refuel, not just the first one per game session. Matches the
-        // semantics of fined/tollgate/ferry/train below (see
-        // RenCloud/scs-sdk-plugin#98).
-        telem_ptr->special_b.refuelPayed ^= true;
-        log_line(SCS_LOG_TYPE_warning,
-                 "[refuel-debug] refuelPayed fired amount=%.2f",
-                 telem_ptr->gameplay_f.refuelAmount);
-      }
-
-      // update last value every few ticks (refuel rate is not constant and the
-      // plugin side did check every 25 ms so to try a constant refuel event for
-      // the whole time a few strange things :D atm
-      if (fuel_ticker > 10)
-      {
-        fuel_ticker = 0;
-
-        if (current_fuel_value == last_fuel_value)
-        {
-          fuel_ticker2++;
+          // Primer frame de subida: todavía no sabemos si es un repostaje real o
+          // un blip de 1-2 frames (glitch de actor tras cargar partida). Guardamos
+          // el nivel previo a la subida y esperamos a ver si se sostiene.
+          fuel_rise_pending = true;
+          fuel_rise_confirm_frames = 1;
+          fuel_rise_baseline = last_fuel_value;
         }
         else
         {
-          fuel_ticker2 = 0;
+          fuel_rise_confirm_frames++;
         }
 
-        if (fuel_ticker2 >= 5)
+        if (fuel_rise_confirm_frames >= FUEL_RISE_CONFIRM_FRAMES_REQUIRED)
         {
-          fuel_ticker2 = 0;
-          telem_ptr->special_b.refuel = false;
+          // Se sostuvo lo suficiente: recién ahora lo tratamos como repostaje real.
+          refuel = true;
+          fuel_rise_pending = false;
+          start_fuel = fuel_rise_baseline;
         }
       }
+    }
+    else if (current_fuel_value < last_fuel_value)
+    {
+      fuel_ticker2 = 0;
+      telem_ptr->special_b.refuel = false;
 
-      fuel_ticker++;
-      last_fuel_value = current_fuel_value;
+      if (fuel_rise_pending)
+      {
+        // La subida no se sostuvo — era ruido/glitch, no un repostaje. Se descarta.
+        fuel_rise_pending = false;
+      }
     }
 
-    engine_enabled_prev = engine_enabled_now;
+    // refuel is true, but engine is now active? than refuel is finished and
+    // payed, fire event
+    if (refuel && telem_ptr->truck_b.engineEnabled)
+    {
+      refuel = false;
+
+      telem_ptr->gameplay_f.refuelAmount = telem_ptr->truck_f.fuel - start_fuel;
+      // Toggle (not assign) so edge-detecting clients see a change on every
+      // refuel, not just the first one per game session. Matches the
+      // semantics of fined/tollgate/ferry/train below (see
+      // RenCloud/scs-sdk-plugin#98).
+      telem_ptr->special_b.refuelPayed ^= true;
+    }
+
+    // update last value every few ticks (refuel rate is not constant and the
+    // plugin side did check every 25 ms so to try a constant refuel event for
+    // the whole time a few strange things :D atm
+    if (fuel_ticker > 10)
+    {
+      fuel_ticker = 0;
+
+      if (current_fuel_value == last_fuel_value)
+      {
+        fuel_ticker2++;
+      }
+      else
+      {
+        fuel_ticker2 = 0;
+      }
+
+      if (fuel_ticker2 >= 5)
+      {
+        fuel_ticker2 = 0;
+        telem_ptr->special_b.refuel = false;
+      }
+    }
+
+    fuel_ticker++;
+    last_fuel_value = current_fuel_value;
   }
 }
 
@@ -896,17 +802,8 @@ SCSAPI_VOID telemetry_configuration(const scs_event_t event,
   // finished it now
   if (type == job && is_empty && telem_ptr->special_b.onJob)
   {
-    if (!post_load_settling)
-    {
-      // Durante el settling post-load, un config "job" vacío puede ser un artefacto
-      // transitorio de la reconstrucción del estado (igual que fuel pasa por 0) y no
-      // un job realmente terminado; lo ignoramos en vez de marcar onJob=false para no
-      // gatillar un job-started fantasma cuando la config real llegue un instante
-      // después. Trade-off: si el job SÍ terminó justo antes/durante el load, este
-      // frame no lo detecta; se resincroniza con el próximo cambio real de job.
-      telem_ptr->special_b.onJob = false;
-      telem_ptr->special_b.jobFinished ^= true;
-    }
+    telem_ptr->special_b.onJob = false;
+    telem_ptr->special_b.jobFinished ^= true;
   }
   else if (!telem_ptr->special_b.onJob && type == job && !is_empty)
   {
