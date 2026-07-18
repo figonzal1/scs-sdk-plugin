@@ -462,6 +462,20 @@ static auto fuel_rise_pending = false;
 static auto fuel_rise_confirm_frames = 0;
 static auto fuel_rise_baseline = 0.0f;
 
+// `onJob` (a sustained state, unlike the toggled one-shots above) is set straight from the
+// "job" channel's presence in telemetry_configuration(). Loading a savegame or starting the
+// game can transiently empty then refill that channel while the truck actor rebuilds — same
+// root cause class as the fuel blip above — producing a false false→true edge and a phantom
+// job-started (and, on the empty side, a phantom job-finished). telemetry_configuration() only
+// records the raw signal (job_config_present) below; the debounce that turns it into the
+// committed onJob transition runs here, per-frame, mirroring the fuel logic.
+static const int JOB_TRANSITION_CONFIRM_FRAMES_REQUIRED = 5;
+static auto job_config_present = false;
+static auto job_start_pending = false;
+static auto job_start_confirm_frames = 0;
+static auto job_end_pending = false;
+static auto job_end_confirm_frames = 0;
+
 // Function: telemetry_frame_start
 // Register telemetry values
 SCSAPI_VOID telemetry_frame_start(const scs_event_t UNUSED(event),
@@ -604,6 +618,45 @@ SCSAPI_VOID telemetry_frame_start(const scs_event_t UNUSED(event),
 
     fuel_ticker++;
     last_fuel_value = current_fuel_value;
+
+    // Debounce onJob against job_config_present (set in telemetry_configuration()) — see the
+    // rationale comment by the static decls above. Gated on !paused: loading screens are where
+    // the blip happens, so frames spent there shouldn't count toward (or reset) a confirmation
+    // in progress.
+    if (!telem_ptr->paused)
+    {
+      if (job_config_present && !telem_ptr->special_b.onJob)
+      {
+        job_start_confirm_frames = job_start_pending ? job_start_confirm_frames + 1 : 1;
+        job_start_pending = true;
+        if (job_start_confirm_frames >= JOB_TRANSITION_CONFIRM_FRAMES_REQUIRED)
+        {
+          telem_ptr->special_b.onJob = true;
+          telem_ptr->gameplay_ui.jobStartingTime = telem_ptr->common_ui.time_abs;
+          job_start_pending = false;
+        }
+      }
+      else
+      {
+        job_start_pending = false;
+      }
+
+      if (!job_config_present && telem_ptr->special_b.onJob)
+      {
+        job_end_confirm_frames = job_end_pending ? job_end_confirm_frames + 1 : 1;
+        job_end_pending = true;
+        if (job_end_confirm_frames >= JOB_TRANSITION_CONFIRM_FRAMES_REQUIRED)
+        {
+          telem_ptr->special_b.onJob = false;
+          telem_ptr->special_b.jobFinished ^= true;
+          job_end_pending = false;
+        }
+      }
+      else
+      {
+        job_end_pending = false;
+      }
+    }
   }
 }
 
@@ -798,18 +851,11 @@ SCSAPI_VOID telemetry_configuration(const scs_event_t event,
     }
     is_empty = false;
   }
-  // if id of config is "job" but without element and we are on a job -> we
-  // finished it now
-  if (type == job && is_empty && telem_ptr->special_b.onJob)
+  // Just record the raw "job" channel presence — telemetry_frame_start() debounces this into
+  // the committed onJob transition (see the rationale comment by its static decls).
+  if (type == job)
   {
-    telem_ptr->special_b.onJob = false;
-    telem_ptr->special_b.jobFinished ^= true;
-  }
-  else if (!telem_ptr->special_b.onJob && type == job && !is_empty)
-  {
-    // oh hey no job but now we have fields in this array so we start a new job
-    telem_ptr->special_b.onJob = true;
-    telem_ptr->gameplay_ui.jobStartingTime = telem_ptr->common_ui.time_abs;
+    job_config_present = !is_empty;
   }
 }
 

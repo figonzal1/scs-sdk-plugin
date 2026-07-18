@@ -32,6 +32,10 @@ No test suite exists. CI (`.github/workflows/cmake.yml`) only builds Release art
 
 Telemetry booleans that represent one-shot gameplay events (`fined`, `tollgate`, `ferry`, `train`, `refuelPayed`, `jobCancelled`, `jobFinished`, `jobDelivered`, in `scs-telemetry/src/scs_telemetry.cpp`) must be flipped with `^= true`, never set with `= true`. Consumers detect the event by diffing the flag's value frame-to-frame; a plain assignment latches the flag `true` forever and any event after the first goes unreported (this exact bug shipped for `refuelPayed` — see the "Changes in this fork" section of README.md). Any new one-shot flag must follow the same toggle pattern.
 
+## Gotcha: sustained-state flags need debouncing against transient blips, not raw assignment
+
+`onJob` is not a one-shot toggle — it's a sustained state (`true` while a job is active) driven straight from the "job" channel's presence in `telemetry_configuration()`. That channel can transiently empty-then-refill on savegame load or game start while the truck actor rebuilds (same root cause class as the `refuelPayed`/fuel blip fixed above), so setting `onJob` directly off a single frame's read produces a phantom false→true edge. The fix: `telemetry_configuration()` only records the raw signal (`job_config_present`); `telemetry_frame_start()` debounces it — `JOB_TRANSITION_CONFIRM_FRAMES_REQUIRED` (5) consecutive un-paused frames — before committing the `onJob` transition, mirroring the `fuel_rise_pending`/`FUEL_RISE_CONFIRM_FRAMES_REQUIRED` pattern a few lines above it. Any new sustained-state flag derived from a `telemetry_configuration()` channel should use the same two-phase (raw signal → debounced commit) shape rather than assigning directly from the config handler.
+
 ## Code style
 
 No `.clang-format`/`.editorconfig` is enforced. Existing source uses Allman brace style, 4-space indent, `#pragma region`/`#pragma endregion` blocks for logical sections, handler functions named `handleXxxYyy`, and SCS SDK struct fields grouped by type-suffix (`_b`, `_i`, `_f`, `_s`, `_ll`, `_ui`).

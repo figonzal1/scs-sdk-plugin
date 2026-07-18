@@ -66,6 +66,14 @@ Binaries will be in the `build/bin` directory.
   toggle semantics this aligns with. The unused `clear_refuel_payed_ticker` (dead code from a
   reset that was apparently never implemented) was also removed. The shared-memory layout is
   unchanged, so existing readers (e.g. `trucksim-telemetry`) work without modification.
+- **Fixed a phantom `job-started`/`job-finished` on savegame load or game start.** Unlike the
+  toggled one-shots above, `onJob` is a sustained state driven straight from the "job" channel's
+  presence in `telemetry_configuration()`. Loading a save or starting the game can transiently
+  empty then refill that channel while the truck actor rebuilds, producing a false
+  false→true edge — same root cause class as the `refuelPayed` fuel blip, same fix shape:
+  `telemetry_configuration()` now only records the raw signal, and `telemetry_frame_start()`
+  debounces it (5 consecutive un-paused frames) before committing the `onJob` transition. Bumped
+  `PLUGIN_REVID` to 15 for traceability; shared-memory layout unchanged.
 
 ## Credits
 
